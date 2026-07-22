@@ -7,16 +7,16 @@ import re
 
 
 
-def add_in_grade_levels(test_results):
+def add_in_grade_levels(test_results, years_data):
     # Initialize the BigQuery client
     client = bigquery.Client(project='icef-437920')
 
-    query_string = '''
+    query_string = f'''
     SELECT DISTINCT 
     CAST(student_number AS STRING) AS local_student_id,
     grade_level AS grade_levels
     FROM `icef-437920.views.student_to_teacher`
-    WHERE year = '25-26'
+    WHERE year = '{years_data}'
     '''
 
     logging.info(f'Executing BigQuery: {query_string}')
@@ -60,19 +60,48 @@ def add_in_unit_col(df):
 
     # For checkpoints that encode standards/lessons in the title, backfill unit only when still missing
     missing_unit_mask = df['unit'].isna() | (df['unit'] == '')
+    n_missing_before = missing_unit_mask.sum()
+    logging.info(f"Unit backfill (Lesson/Math checkpoint): {n_missing_before} rows with missing unit before backfill")
 
     # Pattern 1: "Lesson <number>" e.g. "PLTW Algebra Advantage Checkpoint Lesson 1"
-    df.loc[missing_unit_mask, 'unit'] = df.loc[missing_unit_mask, 'title'].str.extract(
-        r'(Lesson\s+\d+)', expand=False
-    )
+    lesson_filled = df.loc[missing_unit_mask, 'title'].str.extract(r'(Lesson\s+\d+)', expand=False)
+    n_lesson = lesson_filled.notna().sum()
+    df.loc[missing_unit_mask, 'unit'] = lesson_filled
+    if n_lesson > 0:
+        logging.info(f"Unit backfill (Lesson pattern): filled {n_lesson} rows with e.g. 'Lesson 1'")
 
     # Recompute mask in case some units were just filled
     missing_unit_mask = df['unit'].isna() | (df['unit'] == '')
 
     # Pattern 2: standard code between "Math" and "Checkpoint"
     # e.g. "Grade 6 Math 6.RP.A.3.b Checkpoint" -> "6.RP.A.3.b"
-    df.loc[missing_unit_mask, 'unit'] = df.loc[missing_unit_mask, 'title'].str.extract(
+    math_filled = df.loc[missing_unit_mask, 'title'].str.extract(
         r'Math\s+([0-9A-Za-z\.\-]+)\s+Checkpoint', expand=False
+    )
+    n_math = math_filled.notna().sum()
+    df.loc[missing_unit_mask, 'unit'] = math_filled
+    if n_math > 0:
+        logging.info(f"Unit backfill (Math checkpoint pattern): filled {n_math} rows with standard codes e.g. '6.RP.A.3.b'")
+
+    n_still_missing = (df['unit'].isna() | (df['unit'] == '')).sum()
+    logging.info(f"Unit backfill complete: {n_still_missing} rows still have missing unit after backfill")
+
+    # Explicit overrides for known checkpoint titles -> unit values
+    special_title_to_unit = {
+        "PLTW Algebra Advantage Checkpoint Lesson 1": "Lesson 1",
+        "Grade 6 Math 6.RP.A.3.b Checkpoint": "6.RP.A.3.b",
+        "Grade 6 Math 6.RP.A.2 Checkpoint": "6.RP.A.2",
+    }
+    special_mask = df["title"].isin(special_title_to_unit.keys())
+    df.loc[special_mask, "unit"] = df.loc[special_mask, "title"].map(special_title_to_unit)
+
+    # CAST practice test override
+    cast_mask = df['title'] == 'Science Grade 12 CAST Practice Test'
+    df.loc[cast_mask, 'unit'] = 'CAST'
+    logging.info(
+        "CAST practice test override: matched_rows=%s, unit_after=%s",
+        int(cast_mask.sum()),
+        df.loc[cast_mask, 'unit'].dropna().unique().tolist(),
     )
 
     unit_col_sorting = {'Module 1':  '1',
@@ -209,7 +238,7 @@ def add_in_curriculum_col(df):
     df.loc[df['assessment_id'] == '161441', 'curriculum'] = 'Chemistry'  # Grade 10 Science
     df.loc[df['assessment_id'] == '142815', 'curriculum'] = 'Biology'  # Grade 9 Science
     df.loc[df['assessment_id'] == '161471', 'curriculum'] = 'Biology'  # Grade 9 Science
-    df.loc[df['assessment_id'] == '161556', 'curriculum'] = 'Biology'
+    df.loc[df['assessment_id'] == '161556', 'curriculum'] = 'Anatomy'
     
     # Math assessments that should be Geometry or Algebra II based on grade
     df.loc[df['assessment_id'] == '6917b5dd477a07bb7337dfe8', 'curriculum'] = 'Geometry'  # Grade 10 Math Unit 3
@@ -346,9 +375,9 @@ def add_in_exit_ticket_info(test_results):
     return test_results
 
 
-def create_test_results_view(test_results):
+def create_test_results_view(test_results, years_data):
 
-    test_results = add_in_grade_levels(test_results) #subject to be changed to reference BQ view
+    test_results = add_in_grade_levels(test_results, years_data) #subject to be changed to reference BQ view
     test_results = add_in_curriculum_col(test_results)
     test_results = add_in_unit_col(test_results)
     test_results = create_test_type_column(test_results)
@@ -470,7 +499,21 @@ def send_to_gcs(bucket_name, save_path, frame, frame_name):
 
 def bring_together_test_results(test_results_no_standard, test_results_standard):
 
+    logging.info(
+        "bring_together_test_results: "
+        f"standard shape={test_results_standard.shape}, "
+        f"standard cols={list(test_results_standard.columns)}; "
+        f"no_standard shape={test_results_no_standard.shape}, "
+        f"no_standard cols={list(test_results_no_standard.columns)}"
+    )
+
     df = pd.concat([test_results_standard, test_results_no_standard])
+    logging.info(
+        "bring_together_test_results: combined shape=%s, cols=%s",
+        df.shape,
+        list(df.columns),
+    )
+
     df['standard_code'] = df['standard_code'].fillna('percent')
     df = df.drop_duplicates()
 

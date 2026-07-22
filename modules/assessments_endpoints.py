@@ -10,6 +10,7 @@ token_url_illuminate = 'https://icefps.illuminateed.com/live/'
 base_url_illuminate = 'https://icefps.illuminateed.com/live/rest_server.php/Api/'
 current_date = datetime.now()
 current_date = current_date.strftime('%Y-%m-%d')
+REQUEST_TIMEOUT = 60  # seconds; avoids indefinite hangs that surface as Read timed out
 #Currently have url_args hardcoded in each function param to be date filtered
 
 
@@ -29,7 +30,11 @@ def get_all_assessments_metadata(access_token):
 
         try:
             # Make the API request with the current page number
-            response = requests.get(base_url_illuminate + url_ext.format(url_ext), headers=headers)
+            response = requests.get(
+                base_url_illuminate + url_ext.format(url_ext),
+                headers=headers,
+                timeout=REQUEST_TIMEOUT,
+            )
             response.raise_for_status()  # Raise exception for HTTP errors
             
             results = json.loads(response.content)
@@ -94,7 +99,11 @@ def get_single_assessment(access_token, _id, standard_or_no_standard, start_date
 
     while True:
         # Make the API request with the current page number
-        response = requests.get(base_url_illuminate + url_ext, headers=headers)
+        response = requests.get(
+            base_url_illuminate + url_ext,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
 
         # Check if the response is successful
         if response.status_code != 200:
@@ -154,7 +163,11 @@ def get_assessment_scores(access_token, _id, standard_or_no_standard, start_date
         
         logging.debug(base_url_illuminate + url_ext)
         
-        response = requests.get(base_url_illuminate + url_ext, headers=headers)
+        response = requests.get(
+            base_url_illuminate + url_ext,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
         r = response.status_code
         logging.debug(f'The status code for assessment_id {_id} is {r}')
        
@@ -189,13 +202,19 @@ def get_assessment_scores(access_token, _id, standard_or_no_standard, start_date
                     d = [_id, standard_or_no_standard, r, title, num_pages, num_results]
                     logging_list.append(d)
         else:
-            # Log unsuccessful API call and exit
+            # Log unsuccessful API call and raise so the parallel retry pass can re-fetch
             num_pages = 0
             num_results = 0
-            logging.error(f'API call was not successful for {_id}')
+            logging.error(
+                "API call was not successful for %s; status=%s, url=%s, body=%s",
+                _id,
+                r,
+                base_url_illuminate + url_ext,
+                response.text[:500],
+            )
             d = [_id, standard_or_no_standard, r, '', num_pages, num_results]
             logging_list.append(d)
-            break
+            response.raise_for_status()
 
         # Check if all pages have been retrieved
         if page >= num_pages:
@@ -211,71 +230,68 @@ def get_assessment_scores(access_token, _id, standard_or_no_standard, start_date
 
     return df_result, t
 
-# def parallel_get_assessment_scores(spark_session, access_token, assessment_id_list, standard_or_no_standard, start_date, end_date_override=None):
-#     """
-#     This function will parallelize the API calls using Spark's RDD operations.
-#     """
-
-#     # Define the function that will be applied in parallel to each assessment_id
-#     def fetch_assessment_scores(_id):
-#         return get_assessment_scores(access_token, _id, standard_or_no_standard, start_date, end_date_override)
-
-#     # Parallelize the assessment IDs to create an RDD
-#     rdd = spark_session.sparkContext.parallelize(assessment_id_list)
-
-#     # Use map to apply the fetch_assessment_scores function to each element of the RDD
-#     results = rdd.map(fetch_assessment_scores)
-
-#     # Collect the results back to the driver
-#     results_collected = results.collect()
-
-#     # After collect, you will have a list of tuples with (df_result, t)
-#     # Now you can combine them into a single DataFrame and log DataFrame
-#     all_results = []
-#     all_logs = []
-
-#     for df_result, t in results_collected:
-#         all_results.append(df_result)
-#         all_logs.append(t)
-
-#     # Concatenate all results DataFrames into a single DataFrame
-#     final_df = pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
-#     final_logs = pd.concat(all_logs, ignore_index=True) if all_logs else pd.DataFrame()
-
-#     return final_df, final_logs
-
-
 
 def parallel_get_assessment_scores_threaded(
     access_token, assessment_id_list, standard_or_no_standard, start_date,
     end_date_override=None, max_workers=None
 ):
-
-    logging.info(f"Starting parallel_get_assessment_scores_threaded with start_date={start_date}, end_date_override={end_date_override}")
-    
     """
     Parallelize API calls using threads (best for I/O-bound tasks like HTTP requests).
-    Dynamically adjusts the number of threads based on CPU availability.
+    Pass 1: all IDs. Pass 2: retry only IDs that raised (timeouts / HTTP errors).
     """
-    # Dynamically determine number of workers
+    logging.info(
+        f"Starting parallel_get_assessment_scores_threaded with start_date={start_date}, "
+        f"end_date_override={end_date_override}"
+    )
+
     if max_workers is None:
         max_workers = min(32, (os.cpu_count() or 1) + 4)
 
     def fetch(_id):
-        return get_assessment_scores(access_token, _id, standard_or_no_standard, start_date, end_date_override)
+        return get_assessment_scores(
+            access_token, _id, standard_or_no_standard, start_date, end_date_override
+        )
 
-    all_results = []
-    all_logs = []
+    def run_pass(ids, pass_label):
+        results = []
+        logs = []
+        failed_ids = []
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_id = {executor.submit(fetch, _id): _id for _id in assessment_id_list}
-        for future in as_completed(future_to_id):
-            try:
-                df_result, t = future.result()
-                all_results.append(df_result)
-                all_logs.append(t)
-            except Exception as e:
-                logging.error(f"Error fetching assessment ID {future_to_id[future]}: {e}")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_id = {executor.submit(fetch, _id): _id for _id in ids}
+            for future in as_completed(future_to_id):
+                _id = future_to_id[future]
+                try:
+                    df_result, t = future.result()
+                    results.append(df_result)
+                    logs.append(t)
+                except Exception as e:
+                    logging.error(f"Error fetching assessment ID {_id} ({pass_label}): {e}")
+                    failed_ids.append(_id)
+
+        return results, logs, failed_ids
+
+    all_results, all_logs, failed_ids = run_pass(assessment_id_list, "pass 1")
+
+    if failed_ids:
+        logging.info(
+            f"Retrying {len(failed_ids)} failed assessment IDs for {standard_or_no_standard}"
+        )
+        retry_results, retry_logs, still_failed = run_pass(failed_ids, "pass 2 retry")
+        all_results.extend(retry_results)
+        all_logs.extend(retry_logs)
+        if still_failed:
+            preview = still_failed[:20]
+            logging.error(
+                f"{len(still_failed)} assessment IDs still failed after retry "
+                f"for {standard_or_no_standard}. First {len(preview)}: {preview}"
+            )
+        else:
+            logging.info(
+                f"All previously failed assessment IDs succeeded on retry for {standard_or_no_standard}"
+            )
+    else:
+        logging.info(f"No failed assessment IDs on pass 1 for {standard_or_no_standard}")
 
     final_df = pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
     final_logs = pd.concat(all_logs, ignore_index=True) if all_logs else pd.DataFrame()

@@ -1,0 +1,11 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - gcr.io/icef-437920/illuminate-pipeline
+      - -f
+      - dockerfile
+      - .
+images:
+  - gcr.io/icef-437920/illuminate-pipeline
