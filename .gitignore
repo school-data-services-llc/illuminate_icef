@@ -8,3 +8,10 @@ pipeline_output.log
 venv/
 modules/test_yoy_class.py
 notes.md
+# local/one-off scripts (not pipeline code)
+_export_*.py
+_fix_*.py
+_invest_*.py
+_smoke_*.py
+_check_*.py
+test_illuminate_*.py

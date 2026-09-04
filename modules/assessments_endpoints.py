@@ -2,6 +2,7 @@ import requests
 import pandas as pd
 import json
 import logging
+import time
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
@@ -11,7 +12,58 @@ base_url_illuminate = 'https://icefps.illuminateed.com/live/rest_server.php/Api/
 current_date = datetime.now()
 current_date = current_date.strftime('%Y-%m-%d')
 REQUEST_TIMEOUT = 60  # seconds; avoids indefinite hangs that surface as Read timed out
+# Cap parallelism to reduce Illuminate nginx 502 storms under burst load
+DEFAULT_MAX_WORKERS = 10
+# Transient gateway / upstream failures from Illuminate nginx
+RETRYABLE_STATUS_CODES = {502, 503, 504}
+GATEWAY_RETRY_ATTEMPTS = 3  # total tries including the first
+GATEWAY_RETRY_BACKOFF_SECONDS = (1, 2, 3)
 #Currently have url_args hardcoded in each function param to be date filtered
+
+
+def _auth_headers(access_token):
+    """Build Authorization headers from a raw token string or IlluminateTokenSession."""
+    if hasattr(access_token, "get_token"):
+        token = access_token.get_token()
+    else:
+        token = access_token
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _illuminate_get(url, access_token):
+    """GET with auth; refresh once on 401; short backoff retries on 502/503/504."""
+    response = None
+    for attempt in range(1, GATEWAY_RETRY_ATTEMPTS + 1):
+        response = requests.get(url, headers=_auth_headers(access_token), timeout=REQUEST_TIMEOUT)
+
+        if response.status_code == 401 and hasattr(access_token, "force_refresh"):
+            logging.warning(
+                "Illuminate API returned 401 for %s; refreshing token and retrying once",
+                url,
+            )
+            access_token.force_refresh()
+            response = requests.get(
+                url, headers=_auth_headers(access_token), timeout=REQUEST_TIMEOUT
+            )
+
+        if response.status_code not in RETRYABLE_STATUS_CODES:
+            return response
+
+        if attempt >= GATEWAY_RETRY_ATTEMPTS:
+            break
+
+        sleep_s = GATEWAY_RETRY_BACKOFF_SECONDS[min(attempt - 1, len(GATEWAY_RETRY_BACKOFF_SECONDS) - 1)]
+        logging.warning(
+            "Illuminate API returned %s for %s; retry %s/%s after %ss",
+            response.status_code,
+            url,
+            attempt,
+            GATEWAY_RETRY_ATTEMPTS,
+            sleep_s,
+        )
+        time.sleep(sleep_s)
+
+    return response
 
 
 def get_all_assessments_metadata(access_token):
@@ -24,16 +76,14 @@ def get_all_assessments_metadata(access_token):
 
         #Base URL and headers for API requests
         url_ext = f'Assessments/?page={page}&limit=1000'
-        headers = {"Authorization": f"Bearer {access_token}"}
 
         logging.info(f'Fetching data from {base_url_illuminate + url_ext}')
 
         try:
             # Make the API request with the current page number
-            response = requests.get(
+            response = _illuminate_get(
                 base_url_illuminate + url_ext.format(url_ext),
-                headers=headers,
-                timeout=REQUEST_TIMEOUT,
+                access_token,
             )
             response.raise_for_status()  # Raise exception for HTTP errors
             
@@ -92,18 +142,9 @@ def get_single_assessment(access_token, _id, standard_or_no_standard, start_date
     
     logging.info(f'Here is the url_args for the get_single_asssessment function {url_ext}')
 
-    headers = {
-        "Authorization": f"Bearer {access_token}"
-    }
-
-
     while True:
         # Make the API request with the current page number
-        response = requests.get(
-            base_url_illuminate + url_ext,
-            headers=headers,
-            timeout=REQUEST_TIMEOUT,
-        )
+        response = _illuminate_get(base_url_illuminate + url_ext, access_token)
 
         # Check if the response is successful
         if response.status_code != 200:
@@ -140,10 +181,6 @@ def get_assessment_scores(access_token, _id, standard_or_no_standard, start_date
     page = 1
     logging_list = []  # List to store logging information
     df_results_list = []  # List to collect results DataFrames
-    headers = {
-        "Authorization": f"Bearer {access_token}"
-    }
-
 
     while True:
         # Update the URL arguments to reflect the current page number
@@ -163,11 +200,7 @@ def get_assessment_scores(access_token, _id, standard_or_no_standard, start_date
         
         logging.debug(base_url_illuminate + url_ext)
         
-        response = requests.get(
-            base_url_illuminate + url_ext,
-            headers=headers,
-            timeout=REQUEST_TIMEOUT,
-        )
+        response = _illuminate_get(base_url_illuminate + url_ext, access_token)
         r = response.status_code
         logging.debug(f'The status code for assessment_id {_id} is {r}')
        
@@ -245,7 +278,7 @@ def parallel_get_assessment_scores_threaded(
     )
 
     if max_workers is None:
-        max_workers = min(32, (os.cpu_count() or 1) + 4)
+        max_workers = int(os.getenv("ILLUMINATE_MAX_WORKERS", DEFAULT_MAX_WORKERS))
 
     def fetch(_id):
         return get_assessment_scores(
@@ -277,19 +310,22 @@ def parallel_get_assessment_scores_threaded(
         logging.info(
             f"Retrying {len(failed_ids)} failed assessment IDs for {standard_or_no_standard}"
         )
+        # Fresh token before retry pass (covers mid-run expiry storms)
+        if hasattr(access_token, "force_refresh"):
+            access_token.force_refresh()
         retry_results, retry_logs, still_failed = run_pass(failed_ids, "pass 2 retry")
         all_results.extend(retry_results)
         all_logs.extend(retry_logs)
         if still_failed:
             preview = still_failed[:20]
-            logging.error(
+            raise RuntimeError(
                 f"{len(still_failed)} assessment IDs still failed after retry "
-                f"for {standard_or_no_standard}. First {len(preview)}: {preview}"
+                f"for {standard_or_no_standard}. Refusing to continue so GCS is not overwritten. "
+                f"First {len(preview)}: {preview}"
             )
-        else:
-            logging.info(
-                f"All previously failed assessment IDs succeeded on retry for {standard_or_no_standard}"
-            )
+        logging.info(
+            f"All previously failed assessment IDs succeeded on retry for {standard_or_no_standard}"
+        )
     else:
         logging.info(f"No failed assessment IDs on pass 1 for {standard_or_no_standard}")
 

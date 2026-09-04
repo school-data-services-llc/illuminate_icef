@@ -9,6 +9,7 @@ from modules.auth import *
 from modules.assessments_endpoints import *
 from modules.frame_transformations import *
 from gcp_utils_sds import buckets, yoy, append_assessment_titles
+from modules.gcs_upload_guards import validate_result_uploads
 import multiprocessing
 import psutil
 
@@ -39,9 +40,9 @@ def get_assessment_results(years_data, start_date, end_date_override=None):
             "Skipping current-year score fetch; will append historical years only."
         )
 
-    access_token, expires_in = get_access_token()
+    token_session = IlluminateTokenSession()
 
-    assessments_metadata, assessment_id_list = get_all_assessments_metadata(access_token)
+    assessments_metadata, assessment_id_list = get_all_assessments_metadata(token_session)
     assessment_id_list = list(set(assessment_id_list))
     if '115538' in assessment_id_list: #Faulty assessment_id that causes issues.
         assessment_id_list.remove('115538')
@@ -53,9 +54,9 @@ def get_assessment_results(years_data, start_date, end_date_override=None):
         assessment_results_combined = pd.DataFrame()
         illuminate_assessment_results = pd.DataFrame()
     else:
-        assessment_results_group, log_results_group = parallel_get_assessment_scores_threaded(access_token, assessment_id_list, 'Group', start_date, end_date_override)
-        test_results_standard, log_results_standard = parallel_get_assessment_scores_threaded(access_token, assessment_id_list, 'Standard', start_date, end_date_override)
-        test_results_no_standard, log_results_no_standard = parallel_get_assessment_scores_threaded(access_token, assessment_id_list, 'No_Standard', start_date, end_date_override)
+        assessment_results_group, log_results_group = parallel_get_assessment_scores_threaded(token_session, assessment_id_list, 'Group', start_date, end_date_override)
+        test_results_standard, log_results_standard = parallel_get_assessment_scores_threaded(token_session, assessment_id_list, 'Standard', start_date, end_date_override)
+        test_results_no_standard, log_results_no_standard = parallel_get_assessment_scores_threaded(token_session, assessment_id_list, 'No_Standard', start_date, end_date_override)
 
         logging.info(f'Here is the length of the assessment_results_group variable {len(assessment_results_group)}')
         logging.info(f'Here is the length of the test_results_standard variable {len(test_results_standard)}')
@@ -116,6 +117,8 @@ def get_assessment_results(years_data, start_date, end_date_override=None):
     logging.info(f'Sending data for {years_data} school year')
     bucket_name = "illuminatebucket-icefschools-1"
     project_id = "icef-437920"
+
+    validate_result_uploads(frames, dag_name="illuminate_dag", project_id=project_id)
 
     frames["assessments_metadata"] = assessments_metadata
     for frame_name, frame in frames.items():
